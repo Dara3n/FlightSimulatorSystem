@@ -1,88 +1,109 @@
--- Pedro Mario Cea Torralba
--- Iván de Diego Benítez
--- Álvaro Nicolás Díaz Valle
--- Iván García Ventura
+-- FSS – Prototipo 5 (Modo Automático/Manual del Piloto)
 --
--- FSS – Prototipo 3 (avanzado)
+-- Cambios principales:
+--  * Se incorpora la selección de modo AUTOMATIC / MANUAL, conmutada por
+--    pulsación del botón del piloto (interrupción externa).
+--  * Todas las tareas siguen ejecutándose permanentemente, leyendo sensores
+--    y analizando datos, pero las órdenes a actuadores de control del avión
+--    (velocidad, pitch, roll) solo se emiten en modo AUTOMATIC.
+--  * Se añade una tarea Display (1 Hz) que visualiza un “status record”.
 --
--- En este prototipo hemos implementado:
---   · Las tareas periódicas T_Speed, T_Position_Altitude y T_Collision
---     con periodos 300 ms, 200 ms y 250 ms respectivamente.
---
---   · El objeto protegido Protected_Speed_Altitude, que almacena la
---     velocidad y la altitud actuales de la aeronave para que puedan
---     compartirlas Speed, Position_Altitude y Collision.
---
---   · El objeto protegido Protected_Access_Pitch_Roll, que arbitra el
---     acceso a los mandos de Pitch y Roll, dando prioridad a Collision
---     sobre Position_Altitude cuando se ejecuta una maniobra de evasión.
---
---   · El proceso Speed, que:
---       - Lee la potencia del piloto y la mapea a velocidad.
---       - Aplica los incrementos de velocidad por inicio de maniobra
---         de cabeceo (+150 km/h), alabeo (+100 km/h) o ambos (+200 km/h),
---         sin superar nunca 1000 km/h ni bajar de 300 km/h.
---       - Actualiza la velocidad en los motores y en Protected_Speed_Altitude
---         y gestiona la Luz 2 en los valores límite.
---
---   · El proceso Position_Altitude, que:
---       - Lee el joystick del piloto y regula cabeceo y alabeo con
---         zona muerta ±3º y límites ±30º (pitch) y ±45º (roll).
---       - Controla la altitud, la Luz 1 y los mensajes de aviso por
---         exceso de alabeo, publicando además la altitud en
---         Protected_Speed_Altitude.
---
---   · El proceso Collision, que:
---       - Lee la distancia a obstáculos, la velocidad y la altitud
---         desde Protected_Speed_Altitude, así como la luz ambiental
---         y la presencia del piloto.
---       - Calcula el tiempo hasta la colisión y genera alarmas según
---         los umbrales de tiempo definidos.
---       - Cuando es necesario, ordena una maniobra automática de evasión
---         con 45º de alabeo durante unos segundos, bloqueando las
---         órdenes del piloto sobre Pitch y Roll mediante
---         Protected_Access_Pitch_Roll.
+-- Especificación (FSS v2): sección 6 (Modo Automático/Manual) y 7 (Display).
 
 with Kernel.Serial_Output; use Kernel.Serial_Output;
 with Ada.Real_Time;        use Ada.Real_Time;
 with System;               use System;
 
-with Tools;        use Tools;
-with devicesFSS_V1; use devicesFSS_V1;
+with Ada.Interrupts.Names;
+with Button_Interrupt;  -- Generador de interrupciones del botón (simulación)
 
--- NO ACTIVAR ESTE PAQUETE MIENTRAS NO SE TENGA PROGRAMADA LA INTERRUPCION
--- Packages needed to generate button interrupts
--- with Ada.Interrupts.Names;
--- with Button_Interrupt; use Button_Interrupt;
+with Tools;         use Tools;
+with devicesFSS_V1; use devicesFSS_V1;
 
 package body fss is
 
    --------------------------------------------------------------------
-   -- Procedimiento exportado de fondo
+   -- Tipos auxiliares
    --------------------------------------------------------------------
-   procedure Background is
-   begin
-      loop
-         null;
-      end loop;
-   end Background;
+   type Mode_Type is (Automatic, Manual);
+
+   type Warning_Id is (No_Warning,
+                       Warn_Too_Much_Roll,
+                       Warn_Diverting);
 
    --------------------------------------------------------------------
-   -- Cabeceras de procedimientos de tareas
+   -- Estado global para Speed (detección de flancos)
    --------------------------------------------------------------------
-   procedure Speed;
-   procedure Position_Altitude;
-   procedure Collision;
+   Prev_Pitch_For_Speed : Pitch_Samples_Type := 0;
+   Prev_Roll_For_Speed  : Roll_Samples_Type  := 0;
+   Threshold_Pitch      : constant Pitch_Samples_Type := 1;
+   Threshold_Roll       : constant Roll_Samples_Type  := 1;
 
    --------------------------------------------------------------------
-   -- Objetos protegidos PROTOTIPO 3
+   -- Estado global para Collision (maniobra evasiva)
    --------------------------------------------------------------------
+   Diverting  : Boolean := False;
+   Divert_End : Time    := Time_First;
 
-   -- 1) Velocidad y altitud compartidas
+   --------------------------------------------------------------------
+   -- Modo seleccionado (compartido)
+   --------------------------------------------------------------------
+   protected Selected_Mode is
+      pragma Priority (30);
+      procedure Set (M : in Mode_Type);
+      procedure Get (M : out Mode_Type);
+   private
+      Current : Mode_Type := Automatic; -- El sistema arranca en automático
+   end Selected_Mode;
+
+   protected body Selected_Mode is
+      procedure Set (M : in Mode_Type) is
+      begin
+         Current := M;
+      end Set;
+
+      procedure Get (M : out Mode_Type) is
+      begin
+         M := Current;
+      end Get;
+   end Selected_Mode;
+
+   --------------------------------------------------------------------
+   -- Interrupción del botón de modo: ISR + evento para tarea esporádica
+   -- (Attach_Handler a External_Interrupt_2 con prioridad
+   --  System.Interrupt_Priority'First + 9).
+   --------------------------------------------------------------------
+   protected Mode_Interrupt is
+      pragma Interrupt_Priority (System.Interrupt_Priority'First + 9);
+
+      entry Wait_Event;
+
+      procedure ISR;
+      pragma Attach_Handler (ISR, Ada.Interrupts.Names.External_Interrupt_2);
+   private
+      Pending : Boolean := False;
+   end Mode_Interrupt;
+
+   protected body Mode_Interrupt is
+      entry Wait_Event when Pending is
+      begin
+         Pending := False;
+      end Wait_Event;
+
+      procedure ISR is
+      begin
+         Pending := True;
+      end ISR;
+   end Mode_Interrupt;
+
+   --------------------------------------------------------------------
+   -- Datos compartidos: velocidad y altitud actuales
+   --------------------------------------------------------------------
    protected Protected_Speed_Altitude is
       pragma Priority (30);
-      procedure Set_Speed    (S : in Speed_Samples_Type);
-      procedure Get_Speed    (S : out Speed_Samples_Type);
+      procedure Set_Speed_Current (S : in Speed_Samples_Type);
+      procedure Get_Speed_Current (S : out Speed_Samples_Type);
+
       procedure Set_Altitude (A : in Altitude_Samples_Type);
       procedure Get_Altitude (A : out Altitude_Samples_Type);
    private
@@ -91,15 +112,15 @@ package body fss is
    end Protected_Speed_Altitude;
 
    protected body Protected_Speed_Altitude is
-      procedure Set_Speed (S : in Speed_Samples_Type) is
+      procedure Set_Speed_Current (S : in Speed_Samples_Type) is
       begin
          Prot_Speed := S;
-      end Set_Speed;
+      end Set_Speed_Current;
 
-      procedure Get_Speed (S : out Speed_Samples_Type) is
+      procedure Get_Speed_Current (S : out Speed_Samples_Type) is
       begin
          S := Prot_Speed;
-      end Get_Speed;
+      end Get_Speed_Current;
 
       procedure Set_Altitude (A : in Altitude_Samples_Type) is
       begin
@@ -112,9 +133,12 @@ package body fss is
       end Get_Altitude;
    end Protected_Speed_Altitude;
 
-   -- 2) Acceso a Pitch/Roll con prioridad para Collision
+   --------------------------------------------------------------------
+   -- Arbitraje Pitch/Roll: el piloto puede ser bloqueado durante evasión
+   --------------------------------------------------------------------
    protected Protected_Access_Pitch_Roll is
       pragma Priority (30);
+
       -- Escrituras del piloto (Position_Altitude)
       procedure Set_Pitch_Pilot (P : in Pitch_Samples_Type);
       procedure Set_Roll_Pilot  (R : in Roll_Samples_Type);
@@ -188,10 +212,144 @@ package body fss is
       begin
          Collision_Lock := True;
       end Close_Var_Lock;
+
    end Protected_Access_Pitch_Roll;
 
    --------------------------------------------------------------------
-   -- Tareas
+   -- Status record (para Display 1Hz)
+   --------------------------------------------------------------------
+   protected Status_Record is
+      pragma Priority (30);
+
+      procedure Set_Mode (M : in Mode_Type);
+      procedure Set_Power (P : in Power_Samples_Type);
+      procedure Set_Commanded_Speed (S : in Speed_Samples_Type);
+      procedure Set_Current_Speed (S : in Speed_Samples_Type);
+      procedure Set_Altitude (A : in Altitude_Samples_Type);
+      procedure Set_Joystick (J : in Joystick_Samples_Type);
+      procedure Set_Attitude (P : in Pitch_Samples_Type; R : in Roll_Samples_Type);
+      procedure Set_Warning (W : in Warning_Id);
+
+      procedure Get
+        (M          : out Mode_Type;
+         A          : out Altitude_Samples_Type;
+         Power      : out Power_Samples_Type;
+         Cmd_Speed  : out Speed_Samples_Type;
+         Cur_Speed  : out Speed_Samples_Type;
+         J          : out Joystick_Samples_Type;
+         Pitch      : out Pitch_Samples_Type;
+         Roll       : out Roll_Samples_Type;
+         W          : out Warning_Id);
+   private
+      Mode_Sel   : Mode_Type := Automatic;
+      Pow        : Power_Samples_Type := 0;
+      Speed_Cmd  : Speed_Samples_Type := 0;
+      Speed_Cur  : Speed_Samples_Type := 0;
+      Alt        : Altitude_Samples_Type := 8000;
+      Joy        : Joystick_Samples_Type := (x => 0, y => 0);
+      Att_Pitch  : Pitch_Samples_Type := 0;
+      Att_Roll   : Roll_Samples_Type  := 0;
+      Warning    : Warning_Id := No_Warning;
+   end Status_Record;
+
+   protected body Status_Record is
+      procedure Set_Mode (M : in Mode_Type) is
+      begin
+         Mode_Sel := M;
+      end Set_Mode;
+
+      procedure Set_Power (P : in Power_Samples_Type) is
+      begin
+         Pow := P;
+      end Set_Power;
+
+      procedure Set_Commanded_Speed (S : in Speed_Samples_Type) is
+      begin
+         Speed_Cmd := S;
+      end Set_Commanded_Speed;
+
+      procedure Set_Current_Speed (S : in Speed_Samples_Type) is
+      begin
+         Speed_Cur := S;
+      end Set_Current_Speed;
+
+      procedure Set_Altitude (A : in Altitude_Samples_Type) is
+      begin
+         Alt := A;
+      end Set_Altitude;
+
+      procedure Set_Joystick (J : in Joystick_Samples_Type) is
+      begin
+         Joy := J;
+      end Set_Joystick;
+
+      procedure Set_Attitude (P : in Pitch_Samples_Type; R : in Roll_Samples_Type) is
+      begin
+         Att_Pitch := P;
+         Att_Roll  := R;
+      end Set_Attitude;
+
+      procedure Set_Warning (W : in Warning_Id) is
+      begin
+         -- Prioridad: la maniobra de evasión (collision) no se debe ocultar
+         -- por avisos de menor prioridad (p.ej. exceso de roll).
+         if W = Warn_Diverting then
+            Warning := Warn_Diverting;
+         elsif W = Warn_Too_Much_Roll then
+            if Warning /= Warn_Diverting then
+               Warning := Warn_Too_Much_Roll;
+            end if;
+         else -- No_Warning
+            if Warning /= Warn_Diverting then
+               Warning := No_Warning;
+            end if;
+         end if;
+      end Set_Warning;
+
+      procedure Get
+        (M          : out Mode_Type;
+         A          : out Altitude_Samples_Type;
+         Power      : out Power_Samples_Type;
+         Cmd_Speed  : out Speed_Samples_Type;
+         Cur_Speed  : out Speed_Samples_Type;
+         J          : out Joystick_Samples_Type;
+         Pitch      : out Pitch_Samples_Type;
+         Roll       : out Roll_Samples_Type;
+         W          : out Warning_Id) is
+      begin
+         M         := Mode_Sel;
+         A         := Alt;
+         Power     := Pow;
+         Cmd_Speed := Speed_Cmd;
+         Cur_Speed := Speed_Cur;
+         J         := Joy;
+         Pitch     := Att_Pitch;
+         Roll      := Att_Roll;
+         W         := Warning;
+      end Get;
+   end Status_Record;
+
+   --------------------------------------------------------------------
+   -- Background: mantiene vivo el sistema
+   --------------------------------------------------------------------
+   procedure Background is
+   begin
+      loop
+         null;
+      end loop;
+   end Background;
+
+   --------------------------------------------------------------------
+   -- Cabeceras de procesos
+   --------------------------------------------------------------------
+   procedure Speed;
+   procedure Position_Altitude;
+   procedure Collision;
+   procedure Display;
+   procedure Mode_Manager;
+
+   --------------------------------------------------------------------
+   -- Tareas (periodicidad según especificación)
    --------------------------------------------------------------------
    task T_Speed is
       pragma Priority (10);
@@ -205,220 +363,236 @@ package body fss is
       pragma Priority (20);
    end T_Collision;
 
+   task T_Display is
+      pragma Priority (5);
+   end T_Display;
+
+   task T_Mode is
+      pragma Priority (25);
+   end T_Mode;
+
+   --------------------------------------------------------------------
+   -- Task bodies
+   --------------------------------------------------------------------
    task body T_Speed is
-      Next_Release : Time;
-      Period       : Time_Span := Milliseconds (300);
+      Next : Time := Clock + Milliseconds (300);
    begin
-      Next_Release := Tools.Big_Bang + Period;
       loop
          Start_Activity ("T_Speed");
          Speed;
          Finish_Activity ("T_Speed");
-         delay until Next_Release;
-         Next_Release := Next_Release + Period;
+         delay until Next;
+         Next := Next + Milliseconds (300);
       end loop;
    end T_Speed;
 
    task body T_Position_Altitude is
-      Next_Release : Time;
-      Period       : Time_Span := Milliseconds (200);
+      Next : Time := Clock + Milliseconds (200);
    begin
-      Next_Release := Tools.Big_Bang + Period;
       loop
          Start_Activity ("T_Position_Altitude");
          Position_Altitude;
          Finish_Activity ("T_Position_Altitude");
-         delay until Next_Release;
-         Next_Release := Next_Release + Period;
+         delay until Next;
+         Next := Next + Milliseconds (200);
       end loop;
    end T_Position_Altitude;
 
    task body T_Collision is
-      Next_Release : Time;
-      Period       : Time_Span := Milliseconds (250);
+      Next : Time := Clock + Milliseconds (250);
    begin
-      Next_Release := Tools.Big_Bang + Period;
       loop
          Start_Activity ("T_Collision");
          Collision;
          Finish_Activity ("T_Collision");
-         delay until Next_Release;
-         Next_Release := Next_Release + Period;
+         delay until Next;
+         Next := Next + Milliseconds (250);
       end loop;
    end T_Collision;
 
-   --------------------------------------------------------------------
-   -- Estado global para Speed (detección de flancos)
-   --------------------------------------------------------------------
-   Prev_Pitch_For_Speed : Pitch_Samples_Type := 0;
-   Prev_Roll_For_Speed  : Roll_Samples_Type  := 0;
-   Threshold_Pitch      : constant Pitch_Samples_Type := 1;
-   Threshold_Roll       : constant Roll_Samples_Type  := 1;
-
-   --------------------------------------------------------------------
-   -- Estado global para maniobra de evasión de Collision
-   --------------------------------------------------------------------
-   Diverting  : Boolean := False;
-   Divert_End : Time    := Time_First;
-
-   --------------------------------------------------------------------
-   -- Implementación de Speed
-   --------------------------------------------------------------------
-   procedure Speed is
-      MAX_SPEED : constant Speed_Samples_Type := 1000;
-      MIN_SPEED : constant Speed_Samples_Type := 300;
-
-      Current_Pw : Power_Samples_Type := 0;
-      Base_S     : Speed_Samples_Type := 0;
-      Desired_S  : Speed_Samples_Type := 0;
-      Sensed_S   : Speed_Samples_Type := 0;
+   task body T_Display is
+      Next : Time := Clock + Seconds (1);
    begin
-      Read_Power (Current_Pw);
-      Display_Pilot_Power (Current_Pw);
+      loop
+         Start_Activity ("T_Display");
+         Display;
+         Finish_Activity ("T_Display");
+         delay until Next;
+         Next := Next + Seconds (1);
+      end loop;
+   end T_Display;
 
-      Base_S    := Speed_Samples_Type (Float (Current_Pw) * 1.2);
-      Desired_S := Base_S;
+   task body T_Mode is
+   begin
+      loop
+         Start_Activity ("T_Mode");
+         Mode_Manager;
+         Finish_Activity ("T_Mode");
+      end loop;
+   end T_Mode;
 
-      declare
-         P : Pitch_Samples_Type := 0;
-         R : Roll_Samples_Type  := 0;
-         Pitch_Started : Boolean := False;
-         Roll_Started  : Boolean := False;
-      begin
-         Protected_Access_Pitch_Roll.Get_Pitch (P);
-         Protected_Access_Pitch_Roll.Get_Roll  (R);
+   --------------------------------------------------------------------
+   -- Implementación de procesos
+   --------------------------------------------------------------------
 
-         Pitch_Started :=
-           Integer (P) - Integer (Prev_Pitch_For_Speed) > Integer (Threshold_Pitch);
-         Roll_Started  :=
-           Integer (R) - Integer (Prev_Roll_For_Speed)  > Integer (Threshold_Roll);
+   procedure Speed is
+      P         : Power_Samples_Type;
+      Cmd_Speed : Speed_Samples_Type;
+      Mode      : Mode_Type;
 
-         if (Pitch_Started and Roll_Started) then
-            Desired_S :=
-              Speed_Samples_Type (Integer (Desired_S) + 200);
-         elsif (Pitch_Started) then
-            Desired_S :=
-              Speed_Samples_Type (Integer (Desired_S) + 150);
-         elsif (Roll_Started) then
-            Desired_S :=
-              Speed_Samples_Type (Integer (Desired_S) + 100);
-         end if;
+      Cur_Pitch : Pitch_Samples_Type;
+      Cur_Roll  : Roll_Samples_Type;
 
-         if (Desired_S > MAX_SPEED) then
-            Desired_S := MAX_SPEED;
-         elsif (Desired_S < MIN_SPEED) then
-            Desired_S := MIN_SPEED;
-         end if;
+      Cur_Speed : Speed_Samples_Type;
 
-         Set_Speed (Desired_S);
-         Protected_Speed_Altitude.Set_Speed (Desired_S);
+      Pitch_Up  : Boolean := False;
+      Roll_Up   : Boolean := False;
+   begin
+      Read_Power (P);
+      Status_Record.Set_Power (P);
 
-         if (Desired_S = MAX_SPEED) or else (Desired_S = MIN_SPEED) then
-            Light_2 (On);
-         else
-            Light_2 (Off);
-         end if;
+      -- Velocidad base (P * 1.2)
+      Cmd_Speed := Speed_Samples_Type (Float (P) * 1.2);
 
-         Sensed_S := Read_Speed;
-         Display_Speed (Sensed_S);
+      -- Detección de inicio de maniobra por flanco positivo
+      Protected_Access_Pitch_Roll.Get_Pitch (Cur_Pitch);
+      Protected_Access_Pitch_Roll.Get_Roll  (Cur_Roll);
 
-         Prev_Pitch_For_Speed := P;
-         Prev_Roll_For_Speed  := R;
-      end;
+      Pitch_Up := (Cur_Pitch - Prev_Pitch_For_Speed) > Threshold_Pitch;
+      Roll_Up  := (Cur_Roll  - Prev_Roll_For_Speed)  > Threshold_Roll;
+
+      Prev_Pitch_For_Speed := Cur_Pitch;
+      Prev_Roll_For_Speed  := Cur_Roll;
+
+      if Pitch_Up and then Roll_Up then
+         Cmd_Speed := Cmd_Speed + 200;
+      elsif Pitch_Up then
+         Cmd_Speed := Cmd_Speed + 150;
+      elsif Roll_Up then
+         Cmd_Speed := Cmd_Speed + 100;
+      end if;
+
+      -- Saturación 300..1000
+      if Cmd_Speed > 1000 then
+         Cmd_Speed := 1000;
+      elsif Cmd_Speed < 300 then
+         Cmd_Speed := 300;
+      end if;
+
+      Status_Record.Set_Commanded_Speed (Cmd_Speed);
+
+      -- Aviso por límites (siempre, independientemente del modo)
+      if (Cmd_Speed = 300) or else (Cmd_Speed = 1000) then
+         Light_2 (On);
+      else
+         Light_2 (Off);
+      end if;
+
+      -- Actuación (solo en automático)
+      Selected_Mode.Get (Mode);
+      Status_Record.Set_Mode (Mode);
+
+      if Mode = Automatic then
+         devicesFSS_V1.Set_Speed (Cmd_Speed);
+      end if;
+
+      -- Actualiza velocidad actual leída de la aeronave
+      Cur_Speed := Read_Speed;
+      Protected_Speed_Altitude.Set_Speed_Current (Cur_Speed);
+      Status_Record.Set_Current_Speed (Cur_Speed);
    end Speed;
 
-   --------------------------------------------------------------------
-   -- Implementación de Position_Altitude
-   --------------------------------------------------------------------
    procedure Position_Altitude is
-      Current_J      : Joystick_Samples_Type := (0, 0);
-      Target_Pitch   : Pitch_Samples_Type := 0;
-      Target_Roll    : Roll_Samples_Type  := 0;
-      Aircraft_Pitch : Pitch_Samples_Type;
-      Aircraft_Roll  : Roll_Samples_Type;
+      J            : Joystick_Samples_Type;
+      Target_Pitch : Pitch_Samples_Type;
+      Target_Roll  : Roll_Samples_Type;
 
-      Current_A          : Altitude_Samples_Type := 8000;
-      MAX_PITCH          : constant Pitch_Samples_Type := 30;
-      MIN_PITCH          : constant Pitch_Samples_Type := -30;
-      MAX_ROLL           : constant Roll_Samples_Type := 45;
-      MIN_ROLL           : constant Roll_Samples_Type := -45;
-      MAX_ROLL_ALERT     : constant Roll_Samples_Type := 35;
-      MIN_ALTITUDE_ALERT : constant Altitude_Samples_Type := 2500;
-      MAX_ALTITUDE_ALERT : constant Altitude_Samples_Type := 9500;
-      MIN_ALTITUDE       : constant Altitude_Samples_Type := 2000;
-      MAX_ALTITUDE       : constant Altitude_Samples_Type := 10000;
+      Current_Pitch : Pitch_Samples_Type;
+      Current_Roll  : Roll_Samples_Type;
+
+      A     : Altitude_Samples_Type;
+      Mode  : Mode_Type;
    begin
-      Read_Joystick (Current_J);
+      Read_Joystick (J);
+      Status_Record.Set_Joystick (J);
 
-      Target_Pitch := -1 * Pitch_Samples_Type (Current_J (x));
-      Target_Roll  := -1 * Roll_Samples_Type  (Current_J (y));
+      -- El joystick devuelve ángulos; invertimos signo como en prototipos previos
+      Target_Pitch := -Pitch_Samples_Type (J (x));
+      Target_Roll  := -Roll_Samples_Type  (J (y));
 
-      Aircraft_Pitch := Read_Pitch;
-      Aircraft_Roll  := Read_Roll;
+      -- Altitud actual
+      A := Read_Altitude;
+      Protected_Speed_Altitude.Set_Altitude (A);
+      Status_Record.Set_Altitude (A);
 
-      Display_Joystick (Current_J);
-      Display_Pitch (Aircraft_Pitch);
-      Display_Roll  (Aircraft_Roll);
+      -- Estado actual de la aeronave
+      Current_Pitch := Read_Pitch;
+      Current_Roll  := Read_Roll;
+      Status_Record.Set_Attitude (Current_Pitch, Current_Roll);
 
-      Current_A := Read_Altitude;
-      Display_Altitude (Current_A);
-      Protected_Speed_Altitude.Set_Altitude (Current_A);
-
-      if (Current_A < MIN_ALTITUDE_ALERT) then
-         Light_1 (On);
-      elsif (Current_A > MAX_ALTITUDE_ALERT) then
+      -- Luz 1: avisos por altitud
+      if (A < 2500) or else (A > 9500) then
          Light_1 (On);
       else
          Light_1 (Off);
       end if;
-      
-      if (abs (Integer (Target_Pitch)) <= 3) then
-         Protected_Access_Pitch_Roll.Set_Pitch_Pilot (0);
-      elsif (Target_Pitch > MAX_PITCH) then
-         Protected_Access_Pitch_Roll.Set_Pitch_Pilot (MAX_PITCH);
-      elsif (Target_Pitch < MIN_PITCH) then
-         Protected_Access_Pitch_Roll.Set_Pitch_Pilot (MIN_PITCH);
-      else
-         if (Current_A > MAX_ALTITUDE) then
-            Protected_Access_Pitch_Roll.Set_Pitch_Pilot (0);
-         elsif (Current_A < MIN_ALTITUDE) then
-            Protected_Access_Pitch_Roll.Set_Pitch_Pilot (0);
-         else 
-            Protected_Access_Pitch_Roll.Set_Pitch_Pilot (Target_Pitch);
-         end if;
+
+      -- Zona muerta ±3º
+      if Target_Pitch in -3 .. 3 then
+         Target_Pitch := 0;
       end if;
 
-      if (abs (Integer (Target_Roll)) <= 3) then
-         Protected_Access_Pitch_Roll.Set_Roll_Pilot (0);
-      elsif (Target_Roll > MAX_ROLL) then
-         Protected_Access_Pitch_Roll.Set_Roll_Pilot (MAX_ROLL);
-      elsif (Target_Roll < MIN_ROLL) then
-         Protected_Access_Pitch_Roll.Set_Roll_Pilot (MIN_ROLL);
-      else
-         Protected_Access_Pitch_Roll.Set_Roll_Pilot (Target_Roll);
+      if Target_Roll in -3 .. 3 then
+         Target_Roll := 0;
       end if;
 
+      -- Saturación: pitch ±30, roll ±45
+      if Target_Pitch > 30 then
+         Target_Pitch := 30;
+      elsif Target_Pitch < -30 then
+         Target_Pitch := -30;
+      end if;
 
-      if (abs (Integer (Aircraft_Roll)) > Integer (MAX_ROLL_ALERT)) then
-         Display_Message ("Too much roll");
+      if Target_Roll > 45 then
+         Target_Roll := 45;
+      elsif Target_Roll < -45 then
+         Target_Roll := -45;
+      end if;
+
+      -- Nivelado/inhibición por altitud extrema
+      if (A <= 2000) or else (A >= 10_000) then
+         Target_Pitch := 0;
+      end if;
+
+      -- Aviso por exceso de alabeo (Display) -> warning en status
+      if abs (Current_Roll) > 35 then
+         Status_Record.Set_Warning (Warn_Too_Much_Roll);
+      else
+         Status_Record.Set_Warning (No_Warning);
+      end if;
+
+      -- Actuación (solo en automático)
+      Selected_Mode.Get (Mode);
+      Status_Record.Set_Mode (Mode);
+
+      if Mode = Automatic then
+         Protected_Access_Pitch_Roll.Set_Pitch_Pilot (Target_Pitch);
+         Protected_Access_Pitch_Roll.Set_Roll_Pilot  (Target_Roll);
       end if;
    end Position_Altitude;
 
-   --------------------------------------------------------------------
-   -- Implementación de Collision
-   --------------------------------------------------------------------
    procedure Collision is
-      D  : Distance_Samples_Type := 0;
-      L  : Light_Samples_Type    := 0;
+      D  : Distance_Samples_Type;
+      L  : Light_Samples_Type;
       PP : PilotPresence_Samples_Type;
 
-      S : Speed_Samples_Type    := 0;
-      A : Altitude_Samples_Type := 0;
+      Cur_Speed : Speed_Samples_Type;
+      TTC       : Float;
 
-      TTC_Threshold_Warn   : Float := 10.0;
-      TTC_Threshold_Divert : Float := 5.0;
-
-      Now_Time : Time := Clock;
+      Warn_TTC   : Float := 10.0;
+      Div_TTC    : Float := 5.0;
+      Now_Time   : Time  := Clock;
+      Mode       : Mode_Type;
 
       function Time_To_Collision_Seconds
         (Dist : Distance_Samples_Type;
@@ -428,6 +602,7 @@ package body fss is
          if (Spd = 0) then
             return 1.0E9;
          else
+            -- Dist en m, Spd en km/h => factor 3.6
             return Float (Dist) * 3.6 / Float (Spd);
          end if;
       end Time_To_Collision_Seconds;
@@ -437,58 +612,153 @@ package body fss is
       Read_Light_Intensity (L);
       PP := Read_PilotPresence;
 
-      Protected_Speed_Altitude.Get_Speed (S);
-      Protected_Speed_Altitude.Get_Altitude (A);
+      Protected_Speed_Altitude.Get_Speed_Current (Cur_Speed);
 
+      -- Umbrales según visibilidad / presencia
       if (L < 500) or else (PP = 0) then
-         TTC_Threshold_Warn   := 15.0;
-         TTC_Threshold_Divert := 10.0;
-      else
-         TTC_Threshold_Warn   := 10.0;
-         TTC_Threshold_Divert := 5.0;
+         Warn_TTC := 15.0;
+         Div_TTC  := 10.0;
       end if;
 
+      -- Siempre evaluar y avisar (manual o automático)
       if (D > 5000) then
          Alarm (0);
 
-         if (Diverting and then Now_Time >= Divert_End) then
-            Protected_Access_Pitch_Roll.Set_Roll_Collision (0);
-            Protected_Access_Pitch_Roll.Close_Var_Lock;
+         -- Si no hay obstáculo y estábamos desviando, liberamos el lock al terminar
+         if Diverting and then Now_Time >= Divert_End then
+            -- En automático estabilizamos el alabeo; en manual evitamos actuar sobre actuadores.
+            Selected_Mode.Get (Mode);
+            Status_Record.Set_Mode (Mode);
+
+            if Mode = Automatic then
+               Protected_Access_Pitch_Roll.Set_Roll_Collision (0);
+            end if;
+
+            Protected_Access_Pitch_Roll.Open_Var_Lock;  -- FIX: antes estaba Close_Var_Lock
             Diverting := False;
+            Status_Record.Set_Warning (No_Warning);
          end if;
 
          return;
       end if;
 
-      declare
-         TTC : constant Float := Time_To_Collision_Seconds (D, S);
-      begin
-         if (TTC < TTC_Threshold_Warn) then
-            Alarm (4);
+      -- Hay obstáculo: calcula TTC y alarmas
+      TTC := Time_To_Collision_Seconds (D, Cur_Speed);
+
+      if TTC < Warn_TTC then
+         Alarm (4);
+      else
+         Alarm (0);
+      end if;
+
+      -- Actuación (solo en automático)
+      Selected_Mode.Get (Mode);
+      Status_Record.Set_Mode (Mode);
+
+      if Mode /= Automatic then
+         -- Si se cambia a manual durante una evasión, se libera al piloto.
+         if Diverting then
+            Protected_Access_Pitch_Roll.Open_Var_Lock;
+            Diverting := False;
+            Status_Record.Set_Warning (No_Warning);
+         end if;
+         return;
+      end if;
+
+      -- En automático: iniciar o mantener desvío
+      if (not Diverting) and then (TTC < Div_TTC) then
+         Protected_Access_Pitch_Roll.Close_Var_Lock;
+         Protected_Access_Pitch_Roll.Set_Roll_Collision (45);
+         Divert_End := Now_Time + Milliseconds (3000);
+         Diverting := True;
+         Status_Record.Set_Warning (Warn_Diverting);
+      elsif Diverting then
+         if Now_Time >= Divert_End then
+            Protected_Access_Pitch_Roll.Set_Roll_Collision (0);
+            Protected_Access_Pitch_Roll.Open_Var_Lock;
+            Diverting := False;
+            Status_Record.Set_Warning (No_Warning);
          else
-            Alarm (0);
+            Protected_Access_Pitch_Roll.Set_Roll_Collision (45);
+            Status_Record.Set_Warning (Warn_Diverting);
          end if;
+      end if;
+   end Collision;
 
-         if (TTC < TTC_Threshold_Divert) then
-            if (not Diverting) then
-               Protected_Access_Pitch_Roll.Close_Var_Lock;
-               Protected_Access_Pitch_Roll.Set_Roll_Collision (45);
-               Divert_End := Now_Time + Milliseconds (3000);
-               Diverting  := True;
-            end if;
+   procedure Mode_Manager is
+      M : Mode_Type;
+   begin
+      -- Espera esporádica a pulsación del botón (interrupción externa)
+      Mode_Interrupt.Wait_Event;
+
+      Selected_Mode.Get (M);
+      if M = Automatic then
+         M := Manual;
+      else
+         M := Automatic;
+      end if;
+
+      Selected_Mode.Set (M);
+      Status_Record.Set_Mode (M);
+   end Mode_Manager;
+
+   procedure Display is
+      M         : Mode_Type;
+      A         : Altitude_Samples_Type;
+      P         : Power_Samples_Type;
+      Cmd_S     : Speed_Samples_Type;
+      Cur_S     : Speed_Samples_Type;
+      J         : Joystick_Samples_Type;
+      Pitch     : Pitch_Samples_Type;
+      Roll      : Roll_Samples_Type;
+      W         : Warning_Id;
+
+      function Mode_To_String (X : Mode_Type) return String is
+      begin
+         if X = Automatic then
+            return "MODE: AUTOMATIC";
+         else
+            return "MODE: MANUAL";
          end if;
+      end Mode_To_String;
 
-         if (Diverting) then
-            if (Now_Time >= Divert_End) then
-               Protected_Access_Pitch_Roll.Set_Roll_Collision (0);
-               Protected_Access_Pitch_Roll.Open_Var_Lock;
-               Diverting := False;
-            else
-               Protected_Access_Pitch_Roll.Set_Roll_Collision (45);
-            end if;
+      function Warning_To_String (X : Warning_Id) return String is
+      begin
+         case X is
+            when No_Warning =>
+               return "";
+            when Warn_Too_Much_Roll =>
+               return "WARNING: Too much roll";
+            when Warn_Diverting =>
+               return "WARNING: Collision diverting";
+         end case;
+      end Warning_To_String;
+
+   begin
+      Status_Record.Get (M, A, P, Cmd_S, Cur_S, J, Pitch, Roll, W);
+
+      Display_Clear;
+
+      Display_Message (Mode_To_String (M));
+
+      Display_Altitude (A);
+      Display_Pilot_Power (P);
+      Display_Speed (Cmd_S);
+      Display_Joystick (J);
+      Display_Pitch (Pitch);
+      Display_Roll (Roll);
+
+      declare
+         Msg : constant String := Warning_To_String (W);
+      begin
+         if Msg'Length > 0 then
+            Display_Message (Msg);
          end if;
       end;
-   end Collision;
+
+      -- (Opcional) velocidad actual de la aeronave (útil para depuración)
+      Display_Message ("Aircraft Speed (current): " & Integer'Image (Integer (Cur_S)));
+   end Display;
 
 begin
    Start_Activity ("Programa Principal");
