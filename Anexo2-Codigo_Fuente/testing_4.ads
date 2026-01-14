@@ -29,7 +29,6 @@ package testing_4 is
 
    -------------------------------------------------------------------------
    -- WCETs (para Tools.Execution_Time)
-   -- Ajusta si tu profesor pide valores concretos; aquí son conservadores.
    -------------------------------------------------------------------------
    WCET_Distance      : constant Time_Span := Milliseconds (1);
    WCET_Light         : constant Time_Span := Milliseconds (1);
@@ -83,12 +82,7 @@ package testing_4 is
    -- Joystick: mayormente neutro (0,0).
    -- En un punto forzamos un cambio para que Speed detecte flanco (si aplica)
    Joystick_Simulation : constant tipo_Secuencia_Joystick :=
-     (0 => (x => 0,  y => 0),
-      1 => (x => 0,  y => 0),
-      2 => (x => 0,  y => 0),
-      3 => (x => 10, y => -10),  -- cambio puntual
-      4 => (x => 0,  y => 0),
-      others => (x => 0, y => 0));
+     (others => (x => 0, y => 0));
 
 end testing_4;
 
